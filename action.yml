@@ -1,0 +1,125 @@
+name: 'CRA SBOM Evidence'
+description: 'Generate CRA Article 14 evidence pack from SBOM + VEX in CI. Drop-in for any GitHub Actions workflow.'
+author: 'plusultra-tools'
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  sbom-path:
+    description: 'Path to the CycloneDX 1.5 or SPDX 2.3 SBOM file (JSON).'
+    required: false
+    default: 'sbom.json'
+  vex-path:
+    description: 'Path to the OpenVEX or CSAF 2.0 VEX file (JSON). If absent, evidence-pack is generated without VEX cross-references.'
+    required: false
+    default: 'vex.json'
+  output-dir:
+    description: 'Directory where the evidence pack will be written.'
+    required: false
+    default: 'cra-evidence/'
+  fail-on-missing-clause:
+    description: 'Fail the step if any CRA clause cannot be mapped to an evidence field.'
+    required: false
+    default: 'true'
+  cra-sbom-version:
+    description: 'Version of the cra-sbom-evidence PyPI package to install. Use "latest" or a pinned version such as "0.1.0".'
+    required: false
+    default: 'latest'
+  upload-artifact:
+    description: 'If true, upload the evidence-pack directory as a workflow artifact named "cra-evidence-pack".'
+    required: false
+    default: 'true'
+
+outputs:
+  evidence-pack-path:
+    description: 'Absolute path to the generated evidence-pack directory.'
+    value: ${{ steps.run-cli.outputs.evidence-pack-path }}
+  manifest-sha256:
+    description: 'SHA256 of the generated compliance_manifest.json (root of the hash chain).'
+    value: ${{ steps.run-cli.outputs.manifest-sha256 }}
+  clauses-covered:
+    description: 'Comma-separated list of CRA clauses covered by the evidence pack (e.g. "art_13_1,art_14_1,art_14_2").'
+    value: ${{ steps.run-cli.outputs.clauses-covered }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup Python 3.11
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install cra-sbom-evidence
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ "${{ inputs.cra-sbom-version }}" = "latest" ]; then
+          python -m pip install --upgrade pip
+          python -m pip install cra-sbom-evidence
+        else
+          python -m pip install --upgrade pip
+          python -m pip install "cra-sbom-evidence==${{ inputs.cra-sbom-version }}"
+        fi
+        cra-sbom --version
+
+    - name: Generate evidence pack
+      id: run-cli
+      shell: bash
+      env:
+        SBOM_PATH: ${{ inputs.sbom-path }}
+        VEX_PATH: ${{ inputs.vex-path }}
+        OUTPUT_DIR: ${{ inputs.output-dir }}
+        FAIL_ON_MISSING: ${{ inputs.fail-on-missing-clause }}
+      run: |
+        set -euo pipefail
+
+        FAIL_FLAG=""
+        if [ "${FAIL_ON_MISSING}" = "true" ]; then
+          FAIL_FLAG="--fail-on-missing-clause"
+        fi
+
+        VEX_FLAG=""
+        if [ -f "${VEX_PATH}" ]; then
+          VEX_FLAG="--vex ${VEX_PATH}"
+        else
+          echo "::warning::VEX file not found at ${VEX_PATH}; generating evidence-pack without VEX cross-references."
+        fi
+
+        cra-sbom evidence \
+          --sbom "${SBOM_PATH}" \
+          ${VEX_FLAG} \
+          --output "${OUTPUT_DIR}" \
+          ${FAIL_FLAG}
+
+        ABS_OUTPUT="$(cd "${OUTPUT_DIR}" && pwd)"
+        MANIFEST="${ABS_OUTPUT}/compliance_manifest.json"
+
+        if [ ! -f "${MANIFEST}" ]; then
+          echo "::error::compliance_manifest.json was not produced at ${MANIFEST}"
+          exit 1
+        fi
+
+        MANIFEST_SHA=$(python -c "import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "${MANIFEST}")
+        CLAUSES=$(python -c "import json,sys; m=json.load(open(sys.argv[1])); print(','.join(sorted(m.get('clauses_covered', []))))" "${MANIFEST}")
+
+        echo "evidence-pack-path=${ABS_OUTPUT}" >> "$GITHUB_OUTPUT"
+        echo "manifest-sha256=${MANIFEST_SHA}" >> "$GITHUB_OUTPUT"
+        echo "clauses-covered=${CLAUSES}" >> "$GITHUB_OUTPUT"
+
+        {
+          echo "## CRA Evidence Pack"
+          echo ""
+          echo "- **Pack path:** \`${ABS_OUTPUT}\`"
+          echo "- **Manifest SHA-256:** \`${MANIFEST_SHA}\`"
+          echo "- **Clauses covered:** ${CLAUSES}"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Upload evidence pack as workflow artifact
+      if: ${{ inputs.upload-artifact == 'true' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: cra-evidence-pack
+        path: ${{ steps.run-cli.outputs.evidence-pack-path }}
+        if-no-files-found: error
+        retention-days: 90

@@ -1,0 +1,149 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    name: Validate action.yml metadata
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Validate action.yml structure
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import sys, yaml, pathlib
+          p = pathlib.Path("action.yml")
+          data = yaml.safe_load(p.read_text())
+          required = ["name", "description", "runs"]
+          missing = [k for k in required if k not in data]
+          if missing:
+              print(f"action.yml missing required keys: {missing}", file=sys.stderr)
+              sys.exit(1)
+          if data["runs"].get("using") != "composite":
+              print("expected composite action", file=sys.stderr)
+              sys.exit(1)
+          steps = data["runs"].get("steps", [])
+          if not steps:
+              print("composite action has no steps", file=sys.stderr)
+              sys.exit(1)
+          print(f"action.yml OK: name={data['name']!r}, steps={len(steps)}")
+          PY
+
+      - name: Validate example-workflow.yml parses
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import sys, yaml, pathlib
+          for f in ["example-workflow.yml", "tests/test_action.yml", ".github/workflows/release.yml"]:
+              yaml.safe_load(pathlib.Path(f).read_text())
+              print(f"{f}: parsed OK")
+          PY
+
+  smoke-test:
+    name: Smoke test action against fixtures
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Stage fixture SBOM and VEX at default paths
+        shell: bash
+        run: |
+          cp tests/fixtures/cyclonedx-sample.json sbom.json
+          cp tests/fixtures/openvex-sample.json vex.json
+
+      - name: Run action under test
+        id: cra
+        uses: ./
+        with:
+          sbom-path: sbom.json
+          vex-path: vex.json
+          output-dir: cra-evidence/
+          fail-on-missing-clause: 'false'
+          cra-sbom-version: 'latest'
+          upload-artifact: 'false'
+
+      - name: Assert outputs populated
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${{ steps.cra.outputs.evidence-pack-path }}"
+          test -n "${{ steps.cra.outputs.manifest-sha256 }}"
+          test -n "${{ steps.cra.outputs.clauses-covered }}"
+
+  publish:
+    name: Publish GitHub Release
+    needs: [validate, smoke-test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve tag and previous tag
+        id: tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          PREV=$(git tag --sort=-creatordate | grep -v "^${TAG}$" | head -n1 || true)
+          echo "previous=${PREV}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate release notes
+        id: notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tags.outputs.tag }}"
+          PREV="${{ steps.tags.outputs.previous }}"
+          {
+            echo "# sbom-evidence-action ${TAG}"
+            echo ""
+            if [ -n "${PREV}" ]; then
+              echo "## Commits since ${PREV}"
+              git log "${PREV}..${TAG}" --pretty='- %s (%h)'
+            else
+              echo "## Initial release"
+              echo ""
+              echo "See CHANGELOG.md."
+            fi
+            echo ""
+            echo "## Usage"
+            echo ""
+            echo '```yaml'
+            echo "- uses: plusultra-tools/sbom-evidence-action@${TAG}"
+            echo '```'
+          } > release-notes.md
+          cat release-notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tags.outputs.tag }}
+          name: ${{ steps.tags.outputs.tag }}
+          body_path: release-notes.md
+          draft: false
+          prerelease: ${{ contains(steps.tags.outputs.tag, '-') }}
+          files: |
+            action.yml
+            LICENSE
+            README.md
+            CHANGELOG.md

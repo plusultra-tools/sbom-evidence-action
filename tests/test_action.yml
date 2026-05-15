@@ -1,0 +1,62 @@
+name: test-action
+
+# Locally runnable with:
+#   act -W tests/test_action.yml -j test-evidence-action
+#
+# In CI this workflow is invoked by .github/workflows/release.yml as the
+# pre-publish smoke test.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'action.yml'
+      - 'tests/**'
+
+permissions:
+  contents: read
+
+jobs:
+  test-evidence-action:
+    name: Smoke-test composite action against fixtures
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Stage fixture SBOM and VEX at default paths
+        shell: bash
+        run: |
+          cp tests/fixtures/cyclonedx-sample.json sbom.json
+          cp tests/fixtures/openvex-sample.json vex.json
+          ls -la sbom.json vex.json
+
+      - name: Run the action under test
+        id: cra
+        uses: ./
+        with:
+          sbom-path: sbom.json
+          vex-path: vex.json
+          output-dir: cra-evidence/
+          fail-on-missing-clause: 'false'
+          cra-sbom-version: 'latest'
+          upload-artifact: 'true'
+
+      - name: Assert outputs are populated
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${{ steps.cra.outputs.evidence-pack-path }}" || (echo "evidence-pack-path empty"; exit 1)
+          test -n "${{ steps.cra.outputs.manifest-sha256 }}" || (echo "manifest-sha256 empty"; exit 1)
+          test -n "${{ steps.cra.outputs.clauses-covered }}" || (echo "clauses-covered empty"; exit 1)
+          echo "All three outputs populated."
+
+      - name: Assert manifest exists and SHA matches output
+        shell: bash
+        run: |
+          set -euo pipefail
+          MANIFEST="${{ steps.cra.outputs.evidence-pack-path }}/compliance_manifest.json"
+          test -f "${MANIFEST}" || (echo "manifest missing"; exit 1)
+          ACTUAL=$(python -c "import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "${MANIFEST}")
+          test "${ACTUAL}" = "${{ steps.cra.outputs.manifest-sha256 }}" || (echo "sha mismatch"; exit 1)
+          echo "Manifest SHA matches step output."

@@ -1,0 +1,57 @@
+# Example workflow showing the full upstream chain:
+#   1. checkout
+#   2. anchore/sbom-action  -> sbom.json   (CycloneDX 1.5)
+#   3. aquasecurity/trivy   -> vex.json    (OpenVEX)
+#   4. plusultra-tools/sbom-evidence-action -> cra-evidence/ (CRA Art. 14 evidence pack)
+#
+# Drop this file as .github/workflows/cra-evidence.yml in your repo.
+
+name: CRA evidence pack
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evidence:
+    name: Generate CRA evidence pack
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate SBOM (CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          format: cyclonedx-json
+          output-file: sbom.json
+
+      - name: Scan for vulnerabilities and emit OpenVEX
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: '.'
+          format: openvex
+          output: vex.json
+
+      - name: Generate CRA evidence pack
+        id: cra
+        uses: plusultra-tools/sbom-evidence-action@v1
+        with:
+          sbom-path: sbom.json
+          vex-path: vex.json
+          output-dir: cra-evidence/
+          fail-on-missing-clause: 'true'
+          upload-artifact: 'true'
+
+      - name: Show outputs
+        run: |
+          echo "Pack path:      ${{ steps.cra.outputs.evidence-pack-path }}"
+          echo "Manifest SHA:   ${{ steps.cra.outputs.manifest-sha256 }}"
+          echo "Clauses:        ${{ steps.cra.outputs.clauses-covered }}"
